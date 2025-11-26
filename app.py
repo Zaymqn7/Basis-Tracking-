@@ -2,180 +2,203 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime
-import time
 import numpy as np
-from scipy.interpolate import interp1d
+import time
+from datetime import datetime
 
-# --- 0. QUANT CONFIGURATION ---
-REFRESH_RATE = 60 
+# --- CONFIG ---
+REFRESH_RATE = 10  # Faster refresh for live arb
 SPOT_INSTRUMENT = "BTC_USDC"
-MIN_DAYS_THRESHOLD = 7.0  # HARD FILTER: Contracts expiring within 7 days are BLACKLISTED
+PERP_INSTRUMENT = "BTC-PERPETUAL"
+MIN_DAYS = 7  # Gamma Filter
 
-st.set_page_config(page_title="HFT Basis Quant (Stable)", layout="wide")
+st.set_page_config(page_title="HFT Arb Desk", layout="wide")
 
-# --- 1. DATA LAYER: BENCHMARK ---
-@st.cache_data
-def load_benchmark():
-    try:
-        df = pd.read_csv("benchmark_hft.csv")
-        df = df.sort_values("Days_Left", ascending=False)
-        df = df[df['Days_Left'] >= MIN_DAYS_THRESHOLD]
-        return df
-    except FileNotFoundError:
-        return pd.DataFrame()
-
-# --- 2. DATA LAYER: HOURLY HISTORY ---
-@st.cache_data(ttl=300) 
-def get_curve_history():
-    url = "https://www.deribit.com/api/v2/public/get_instruments"
-    tv_url = "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
+# --- 1. DATA LAYER: LIVE SNAPSHOTS ---
+def get_market_snapshot():
+    # We fetch everything in one go to minimize latency skew
+    url_ticker = "https://www.deribit.com/api/v2/public/ticker"
+    url_inst = "https://www.deribit.com/api/v2/public/get_instruments"
     
+    # A. Get Active Instruments
     try:
-        resp = requests.get(url, params={"currency": "BTC", "kind": "future", "expired": "false"}).json()['result']
-        futures = [i for i in resp if i['settlement_period'] != 'perpetual']
-    except: return pd.DataFrame()
+        futures = requests.get(url_inst, params={"currency": "BTC", "kind": "future", "expired": "false"}).json()['result']
+        futures = [f for f in futures if f['settlement_period'] != 'perpetual']
+    except: return pd.DataFrame(), {}
 
-    live_rows = []
-    now_ts = int(time.time() * 1000)
-    start_ts = now_ts - (180 * 24 * 60 * 60 * 1000) 
+    # B. Get Spot Price
+    try:
+        s_resp = requests.get(url_ticker, params={"instrument_name": SPOT_INSTRUMENT}).json()['result']
+        spot_price = (s_resp['best_bid_price'] + s_resp['best_ask_price']) / 2
+    except: return pd.DataFrame(), {}
 
+    # C. Get Perp Data (Anchor & Rabbit)
+    perp_data = {}
+    try:
+        # 1. Rabbit (Live)
+        p_resp = requests.get(url_ticker, params={"instrument_name": PERP_INSTRUMENT}).json()['result']
+        perp_data['live_funding_apy'] = p_resp['current_funding'] * 3 * 365 * 100
+        
+        # 2. Anchor (Last Realized 8H)
+        # We assume the current 'funding_8h' field is the rolling prediction. 
+        # For true realized, we'd query settlement history, but for speed we use 8h avg approximation if available, 
+        # or we just label the current 8h interval as the "Live Block".
+        # For this model, we'll treat 'interest_value' or 'stats' as proxy if needed, 
+        # but standard ticker 'funding_8h' is the standard "current interval" rate.
+        # Let's stick to current_funding vs a damped version.
+        perp_data['mark_price'] = p_resp['mark_price']
+    except: 
+        perp_data = {'live_funding_apy': 0}
+
+    # D. Get Futures Yields
+    rows = []
     for f in futures:
         try:
-            # --- CRITICAL FIX: CONTRACT LEVEL FILTER ---
-            # Check expiry BEFORE fetching data. 
+            t_resp = requests.get(url_ticker, params={"instrument_name": f['instrument_name']}).json()['result']
+            mid_price = (t_resp['best_bid_price'] + t_resp['best_ask_price']) / 2
+            
+            # Time Calc
             expiry_ts = f['expiration_timestamp']
-            days_until_expiry = (datetime.fromtimestamp(expiry_ts/1000) - datetime.now()).total_seconds() / (24 * 3600)
+            days_left = (datetime.fromtimestamp(expiry_ts/1000) - datetime.now()).total_seconds() / (24 * 3600)
             
-            # If the snake is too close to the wall, kill it immediately.
-            if days_until_expiry < MIN_DAYS_THRESHOLD:
-                continue 
+            if days_left < MIN_DAYS: continue
 
-            # Fetch Future & Spot
-            p_fut = {"instrument_name": f['instrument_name'], "start_timestamp": start_ts, "end_timestamp": now_ts, "resolution": "60"}
-            p_spot = {"instrument_name": SPOT_INSTRUMENT, "start_timestamp": start_ts, "end_timestamp": now_ts, "resolution": "60"}
+            # APY Calc
+            # ((Future - Spot) / Spot) * (365/Days)
+            basis_pct = (mid_price - spot_price) / spot_price
+            apy = basis_pct * (365 / days_left) * 100
             
-            d_fut = requests.get(tv_url, params=p_fut).json()
-            d_spot = requests.get(tv_url, params=p_spot).json()
-            
-            if 'result' not in d_fut or d_fut['result']['status'] == 'no_data': continue
-            if 'result' not in d_spot or d_spot['result']['status'] == 'no_data': continue
-
-            # Merge
-            df_f = pd.DataFrame(d_fut['result'])[['ticks', 'close']].rename(columns={'close': 'Future', 'ticks': 'Timestamp'})
-            df_s = pd.DataFrame(d_spot['result'])[['ticks', 'close']].rename(columns={'close': 'Spot', 'ticks': 'Timestamp'})
-            df = pd.merge(df_f, df_s, on='Timestamp', how='inner')
-            
-            # Calculations
-            expiry_date = datetime.fromtimestamp(expiry_ts/1000)
-            df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
-            df['Days_Left'] = (expiry_date - df['Date']).dt.total_seconds() / (24 * 3600)
-            
-            # Double check: Filter rows too (for the history part)
-            df = df[(df['Days_Left'] >= MIN_DAYS_THRESHOLD) & (df['Days_Left'] <= 180)]
-            
-            if not df.empty:
-                df['Basis_Pct'] = (df['Future'] - df['Spot']) / df['Spot']
-                df['APY'] = df['Basis_Pct'] * (365 / df['Days_Left']) * 100
-                df['Contract'] = f['instrument_name']
-                live_rows.append(df)
+            rows.append({
+                "Contract": f['instrument_name'],
+                "Days_Left": days_left,
+                "APY": apy,
+                "Price": mid_price
+            })
         except: continue
         
-    if live_rows: return pd.concat(live_rows)
-    return pd.DataFrame()
+    return pd.DataFrame(rows), perp_data
 
-# --- 3. ENGINE: Z-SCORE ---
-def calculate_quant_signals(live_df, bench_df):
-    if bench_df.empty or live_df.empty: return live_df
+# --- 2. MATH LAYER: CURVE FITTING ---
+def fit_curves(df):
+    if df.empty or len(df) < 3: return None, None
     
-    bench_df = bench_df.sort_values("Days_Left")
+    # X and Y for fitting
+    x = df['Days_Left'].values
+    y = df['APY'].values
     
-    f_med = interp1d(bench_df['Days_Left'], bench_df['Median_APY'], fill_value="extrapolate")
-    f_q1 = interp1d(bench_df['Days_Left'], bench_df['Q1_APY'], fill_value="extrapolate")
-    f_q3 = interp1d(bench_df['Days_Left'], bench_df['Q3_APY'], fill_value="extrapolate")
+    # 1. Log-Linear Fit (Stiff)
+    # y = a + b * ln(x) -> Linear fit on (ln(x), y)
+    try:
+        coeffs_log = np.polyfit(np.log(x), y, 1) # Degree 1
+        # Function to generate line
+        fit_log_y = coeffs_log[0] * np.log(x) + coeffs_log[1]
+    except: fit_log_y = y # Fallback
+
+    # 2. Quadratic Fit (Flexible)
+    # y = ax^2 + bx + c
+    try:
+        coeffs_poly = np.polyfit(x, y, 2) # Degree 2
+        fit_poly_y = np.polyval(coeffs_poly, x)
+    except: fit_poly_y = y
     
-    live_df['Exp_Median'] = f_med(live_df['Days_Left'])
-    live_df['Exp_Q1'] = f_q1(live_df['Days_Left'])
-    live_df['Exp_Q3'] = f_q3(live_df['Days_Left'])
+    return fit_log_y, fit_poly_y
+
+# --- 3. VISUALIZATION ---
+st.title("⚡ HFT Relative Value Desk")
+
+live_df, perp_data = get_market_snapshot()
+
+if live_df.empty:
+    st.error("Market Data Unavailable or blocked by 7-Day Filter.")
+    time.sleep(5)
+    st.rerun()
+
+# Run Fits
+live_df = live_df.sort_values("Days_Left")
+log_y, poly_y = fit_curves(live_df)
+
+if log_y is not None:
+    live_df['Fair_Log'] = log_y
+    live_df['Fair_Poly'] = poly_y
+    # Residuals (Distance from Stiff Curve)
+    live_df['Residual'] = live_df['APY'] - live_df['Fair_Log']
+
+# --- LAYOUT ---
+col1, col2 = st.columns(2)
+
+# --- CHART 1: CURVE GEOMETRY ---
+with col1:
+    st.subheader("1. Curve Residuals (Spatial Arb)")
+    fig_curve = go.Figure()
+
+    # The Dots (Real Market)
+    fig_curve.add_trace(go.Scatter(
+        x=live_df['Days_Left'], y=live_df['APY'],
+        mode='markers+text', text=live_df['Contract'].str.replace("BTC-",""),
+        textposition="top center",
+        marker=dict(size=14, color=live_df['Residual'], colorscale="RdBu_r", cmin=-2, cmax=2),
+        name='Live Contracts'
+    ))
+
+    # The Fits
+    if log_y is not None:
+        fig_curve.add_trace(go.Scatter(
+            x=live_df['Days_Left'], y=live_df['Fair_Log'],
+            mode='lines', line=dict(color='cyan', width=2, dash='dash'),
+            name='Stiff Fit (Log-Linear)'
+        ))
+        fig_curve.add_trace(go.Scatter(
+            x=live_df['Days_Left'], y=live_df['Fair_Poly'],
+            mode='lines', line=dict(color='gray', width=1, dash='dot'),
+            name='Flex Fit (Quadratic)'
+        ))
+
+    fig_curve.update_layout(
+        xaxis_title="Days Until Expiration", yaxis_title="Annualized Yield (%)",
+        xaxis=dict(autorange="reversed"), height=500,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(0,0,0,0.5)")
+    )
+    st.plotly_chart(fig_curve, use_container_width=True)
+    st.caption("**Dot Color:** Red = Rich (Sell), Blue = Cheap (Buy) vs Stiff Curve.")
+
+# --- CHART 2: FUNDING ARB ---
+with col2:
+    st.subheader("2. Cost of Carry (Funding Arb)")
     
-    live_df['IQR'] = live_df['Exp_Q3'] - live_df['Exp_Q1']
-    live_df['Sigma_Proxy'] = live_df['IQR'] / 1.35
-    live_df['Sigma_Proxy'] = live_df['Sigma_Proxy'].replace(0, 1) 
+    # Prepare Data for Bar Chart
+    # We create a dataframe to plot easy bars
+    carry_data = []
     
-    live_df['Z_Score'] = (live_df['APY'] - live_df['Exp_Median']) / live_df['Sigma_Proxy']
+    # 1. The Perp (Rabbit)
+    carry_data.append({
+        "Instrument": "PERP (Live)", "APY": perp_data.get('live_funding_apy', 0), "Color": "crimson"
+    })
     
-    return live_df
-
-# --- 4. VISUALIZATION ---
-st.title("🛡️ Systematic Basis Engine (Strict Filter)")
-
-bench_df = load_benchmark()
-full_df = get_curve_history()
-
-if full_df.empty:
-    st.info("No contracts found meeting the > 7 days safety criteria.")
-    st.stop()
-
-scored_df = calculate_quant_signals(full_df, bench_df)
-
-# Extract Latest Signal
-latest_scores = scored_df.sort_values('Timestamp').groupby('Contract').tail(1).sort_values("Days_Left")
-
-# --- HEATMAP ---
-st.subheader(f"1. Regime Scoreboard (> {int(MIN_DAYS_THRESHOLD)} Days)")
-
-if not latest_scores.empty:
-    cols = st.columns(len(latest_scores))
-    for i, (idx, row) in enumerate(latest_scores.iterrows()):
+    # 2. The Futures
+    for idx, row in live_df.iterrows():
         c_name = row['Contract'].replace("BTC-", "")
-        z = row['Z_Score']
-        val = row['APY']
+        carry_data.append({
+            "Instrument": c_name, "APY": row['APY'], "Color": "teal"
+        })
         
-        color = "off"
-        if z > 2.0: color = "inverse" # Sell
-        elif z < -2.0: color = "normal" # Buy
-        
-        with cols[i]:
-            st.metric(label=c_name, value=f"{val:.2f}%", delta=f"{z:.2f} σ", delta_color=color)
-else:
-    st.warning("No active contracts outside the volatility zone.")
-
-# --- CHART ---
-st.subheader("2. Yield Term Structure")
-fig = go.Figure()
-
-if not bench_df.empty:
-    fig.add_trace(go.Scatter(
-        x=pd.concat([bench_df['Days_Left'], bench_df['Days_Left'][::-1]]),
-        y=pd.concat([bench_df['Q3_APY'], bench_df['Q1_APY'][::-1]]),
-        fill='toself', fillcolor='rgba(0, 255, 255, 0.05)', line=dict(width=0),
-        hoverinfo="skip", name='Normal Regime (IQR)'
+    df_carry = pd.DataFrame(carry_data)
+    
+    fig_carry = go.Figure()
+    fig_carry.add_trace(go.Bar(
+        x=df_carry['Instrument'], y=df_carry['APY'],
+        marker_color=df_carry['Color'], text=df_carry['APY'].apply(lambda x: f"{x:.1f}%"),
+        textposition='auto'
     ))
-    fig.add_trace(go.Scatter(
-        x=bench_df['Days_Left'], y=bench_df['Median_APY'],
-        mode='lines', line=dict(color='cyan', width=1, dash='dash'), name='Fair Value (Median)'
-    ))
+    
+    fig_carry.update_layout(
+        yaxis_title="Annualized Cost (%)", height=500
+    )
+    st.plotly_chart(fig_carry, use_container_width=True)
+    st.caption("**Strategy:** If Red Bar (Perp) >> Teal Bars (Fut) -> Short Perp / Long Future.")
 
-colors = px.colors.qualitative.Bold
-active_contracts = scored_df['Contract'].unique()
-
-for i, c in enumerate(active_contracts):
-    c_df = scored_df[scored_df['Contract'] == c]
-    fig.add_trace(go.Scatter(
-        x=c_df['Days_Left'], y=c_df['APY'],
-        mode='lines', line=dict(color=colors[i % len(colors)], width=2),
-        name=c
-    ))
-
-fig.update_layout(
-    xaxis_title="Days Until Expiration", yaxis_title="Annualized Yield (%)",
-    xaxis=dict(autorange="reversed"), height=700, hovermode="closest",
-    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(0,0,0,0.5)")
-)
-
-st.plotly_chart(fig, use_container_width=True)
-st.caption(f"Last Update: {datetime.now().strftime('%H:%M:%S')} | Latency: ~1 Hour | Model: Robust Median Z-Score")
+# --- RAW DATA TABLE ---
+with st.expander("Quant Monitor (Live Details)"):
+    st.dataframe(live_df.style.format("{:.2f}"))
 
 time.sleep(REFRESH_RATE)
 st.rerun()
