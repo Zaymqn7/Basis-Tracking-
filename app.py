@@ -6,113 +6,153 @@ import time
 from datetime import datetime
 
 # --- Configuration ---
-REFRESH_RATE = 6  # Seconds
-st.set_page_config(page_title="Live Basis Monitor", layout="wide")
+SPOT_INSTRUMENT = "BTC_USDC"  # The actual Spot Asset
+ST_CONFIG = st.set_page_config(page_title="BTC EFP Decay (Spot)", layout="wide")
 
-# --- 1. Get Instruments (Cached) ---
+# --- 1. Fetch Active Futures (Cached) ---
 @st.cache_data(ttl=3600)
 def get_instruments():
-    # We fetch ALL BTC futures
     url = "https://www.deribit.com/api/v2/public/get_instruments"
     params = {"currency": "BTC", "kind": "future", "expired": "false"}
     try:
         resp = requests.get(url, params=params).json()['result']
-        # Filter out Perpetuals, we only want Dated Futures
+        # Filter for dated futures only (exclude perpetuals)
         return [i for i in resp if i['settlement_period'] != 'perpetual']
     except Exception as e:
-        st.error(f"Failed to fetch instruments: {e}")
+        st.error(f"Error fetching instruments: {e}")
         return []
 
-# --- 2. Get Live Prices (Spot & Futures) ---
-def get_live_data(futures_list):
-    # A. Get SPOT Price (BTC_USDC) - "Tradable"
-    spot_url = "https://www.deribit.com/api/v2/public/ticker"
+# --- 2. Fetch Historical Candles (Spot vs Future) ---
+@st.cache_data(ttl=600)
+def get_historical_basis(contract_name, expiry_timestamp):
+    # End time = Now
+    end_ts = int(time.time() * 1000)
+    # Look back 365 days (max)
+    start_ts = end_ts - (365 * 24 * 60 * 60 * 1000) 
+    
+    url = "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
+    
+    # A. Get Future History (Daily Close)
+    params_fut = {
+        "instrument_name": contract_name, 
+        "start_timestamp": start_ts, 
+        "end_timestamp": end_ts, 
+        "resolution": "1D"
+    }
     try:
-        spot_resp = requests.get(spot_url, params={"instrument_name": "BTC_USDC"}).json()['result']
-        spot_mid = (spot_resp['best_bid_price'] + spot_resp['best_ask_price']) / 2
-    except Exception:
-        st.error("Could not fetch Spot BTC_USDC. Market might be down.")
-        return 0, pd.DataFrame()
+        data_fut = requests.get(url, params=params_fut).json()
+        if 'result' not in data_fut or data_fut['result']['status'] == 'no_data':
+            return pd.DataFrame()
+        
+        df_fut = pd.DataFrame(data_fut['result'])
+        df_fut = df_fut[['ticks', 'close']].rename(columns={'close': 'Future_Price', 'ticks': 'Timestamp'})
+    except:
+        return pd.DataFrame()
 
-    # B. Get Futures Prices
-    rows = []
-    for f in futures_list:
-        try:
-            # Fetch ticker for this specific future
-            ticker = requests.get(spot_url, params={"instrument_name": f['instrument_name']}).json()['result']
+    # B. Get Spot BTC_USDC History (Daily Close)
+    params_spot = {
+        "instrument_name": SPOT_INSTRUMENT, 
+        "start_timestamp": start_ts, 
+        "end_timestamp": end_ts, 
+        "resolution": "1D"
+    }
+    try:
+        data_spot = requests.get(url, params=params_spot).json()
+        if 'result' not in data_spot or data_spot['result']['status'] == 'no_data':
+            return pd.DataFrame() # If spot is down or empty
             
-            # Calculate Mid Price
-            fut_mid = (ticker['best_bid_price'] + ticker['best_ask_price']) / 2
-            
-            # Calculate Expiry
-            expiry_ts = f['expiration_timestamp'] / 1000
-            expiry_date = datetime.fromtimestamp(expiry_ts)
-            days_left = (expiry_date - datetime.now()).days
-            if days_left <= 0: days_left = 0.5 # Avoid division by zero
+        df_spot = pd.DataFrame(data_spot['result'])
+        df_spot = df_spot[['ticks', 'close']].rename(columns={'close': 'Spot_Price', 'ticks': 'Timestamp'})
+    except:
+        return pd.DataFrame()
 
-            # --- THE MATH ---
-            basis_usd = fut_mid - spot_mid
-            # Annualized % = (Basis / Spot) * (365 / Days)
-            basis_apr = (basis_usd / spot_mid) * (365 / days_left) * 100
+    # C. Merge Future & Spot on Date
+    # We use inner join: we only want days where BOTH traded
+    df = pd.merge(df_fut, df_spot, on='Timestamp', how='inner')
+    
+    # Convert Timestamp to human date
+    df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
+    
+    # Calculate Days to Expiry
+    expiry_date = datetime.fromtimestamp(expiry_timestamp / 1000)
+    df['Days_to_Expiry'] = (expiry_date - df['Date']).dt.days
+    
+    # Filter: Keep only positive days (ignore post-expiry data)
+    df = df[df['Days_to_Expiry'] >= 0]
+    
+    # Calculate Basis ($)
+    df['Basis_USD'] = df['Future_Price'] - df['Spot_Price']
+    df['Contract'] = contract_name
+    
+    return df
 
-            rows.append({
-                "Contract": f['instrument_name'],
-                "Date": expiry_date.strftime('%Y-%m-%d'),
-                "Days": days_left,
-                "Fut Price": fut_mid,
-                "Basis ($)": basis_usd,
-                "Annualized (%)": basis_apr
-            })
-        except Exception:
-            continue
-            
-    return spot_mid, pd.DataFrame(rows)
+# --- 3. Main Dashboard ---
+st.title("📉 BTC EFP Decay Tracker (Spot vs Future)")
+st.markdown(f"""
+**Strategy:** Tracking the **Exchange for Physical (EFP)** spread decay.
+* **Spot Leg:** {SPOT_INSTRUMENT}
+* **Future Leg:** Dated Futures (e.g., BTC-27DEC24)
+* **Logic:** As time passes (moving right on the chart), the Basis should decay to $0.
+""")
 
-# --- 3. The Dashboard Layout ---
-st.title("⚡ BTC Basis Term Structure (Mid-Price)")
+instruments = get_instruments()
 
-# Fetch Data
-futures = get_instruments()
-if futures:
-    spot_price, df = get_live_data(futures)
+if not instruments:
+    st.warning("No active futures found.")
+    st.stop()
 
-    # Top Metrics
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Spot BTC/USDC (Mid)", f"${spot_price:,.2f}")
-    c2.metric("Contracts Tracked", len(df))
-    if not df.empty:
-        # Sort by date so the line chart connects correctly
-        df = df.sort_values("Days")
-        
-        # Best yield highlight
-        best_yield = df.loc[df['Annualized (%)'].idxmax()]
-        c3.metric("Best Yield", f"{best_yield['Annualized (%)']:.2f}%", best_yield['Contract'])
+# Progress Bar
+progress_text = "Analyzing EFP history..."
+my_bar = st.progress(0, text=progress_text)
+all_history = []
 
-        # --- Visualizations ---
-        st.markdown("---")
-        
-        # Chart 1: The Yield Curve (Annualized)
-        st.subheader("1. Annualized Basis Yield Curve (%)")
-        st.caption("This curve shows the 'Cost of Carry'. If it slopes up, the market expects higher prices later.")
-        
-        fig_curve = px.line(df, x="Date", y="Annualized (%)", markers=True, 
-                            text="Annualized (%)", hover_data=["Contract", "Basis ($)"])
-        fig_curve.update_traces(texttemplate='%{y:.2f}%', textposition="top center", line_shape="spline")
-        fig_curve.update_layout(height=500, xaxis_title="Expiration Date", yaxis_title="Annualized Return (%)")
-        st.plotly_chart(fig_curve, use_container_width=True)
+for index, instr in enumerate(instruments):
+    # Update Progress
+    my_bar.progress((index + 1) / len(instruments), text=f"Fetching {instr['instrument_name']}...")
+    
+    # Fetch
+    df_contract = get_historical_basis(instr['instrument_name'], instr['expiration_timestamp'])
+    if not df_contract.empty:
+        all_history.append(df_contract)
 
-        # Chart 2: Dollar Basis (Bar)
-        st.subheader("2. Raw Price Difference ($)")
-        st.caption("How many dollars more expensive is the Future compared to Spot?")
-        
-        fig_bar = px.bar(df, x="Contract", y="Basis ($)", color="Basis ($)", 
-                         color_continuous_scale="Tealgrn")
-        st.plotly_chart(fig_bar, use_container_width=True)
-        
-        # Raw Data
-        with st.expander("Show Raw Data Table"):
-            st.dataframe(df.style.format({"Fut Price": "{:.2f}", "Basis ($)": "{:.2f}", "Annualized (%)": "{:.2f}"}))
+my_bar.empty()
 
-# Auto-Refresh
-time.sleep(REFRESH_RATE)
-st.rerun()
+if all_history:
+    full_df = pd.concat(all_history)
+    
+    # --- The "EFP Decay" Chart ---
+    st.subheader("Historical Basis Decay (Convergence)")
+    
+    # We construct the chart
+    fig = px.line(full_df, 
+                  x="Days_to_Expiry", 
+                  y="Basis_USD", 
+                  color="Contract",
+                  title="EFP Term Structure Decay",
+                  hover_data=["Date", "Future_Price", "Spot_Price"])
+    
+    # CRITICAL: Reverse X Axis so 0 (Expiry) is on the RIGHT
+    fig.update_layout(xaxis=dict(autorange="reversed"), hovermode="x unified")
+    
+    # Add Zero Line (Target)
+    fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, annotation_text="Parity ($0)")
+    
+    fig.update_xaxes(title_text="Days Until Expiration")
+    fig.update_yaxes(title_text="Basis Spread ($)")
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # --- Context Analysis ---
+    st.info("""
+    **How to spot 'Cheap' or 'Expensive' Basis:**
+    Look vertically at a specific time (e.g., '60 Days Left'). 
+    If the current contract's line is significantly **higher** than previous contracts were at 60 days, 
+    the EFP is currently expensive (Good to Short Future / Long Spot).
+    """)
+
+else:
+    st.error("Could not retrieve historical data. Note: BTC_USDC spot history on Deribit starts ~April 2023.")
+
+# Refresh
+if st.button('Refresh Data'):
+    st.rerun()
